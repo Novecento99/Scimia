@@ -3,3 +3,4 @@ numpy
 sounddevice
 soundfile
 pyqt6
+requests

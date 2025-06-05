@@ -1,459 +1,492 @@
 import sys
-
 import numpy as np
+import requests
 import sounddevice as sd
+from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+                             QLabel, QTabWidget, QPushButton, QMessageBox, QApplication)
+from PyQt6.QtCore import pyqtSignal, QTimer, Qt
+import traceback
+import time
 
-from PyQt6.QtWidgets import *
-from PyQt6.QtCore import QTimer
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont
+# Import Setup Utilities
+from appSetup import discover_audio_devices, load_initial_configuration
 
-
-from configparser import ConfigParser
-
-
-#
-#         __o
-#       _ \<_
-#      (_)/(_)
-# ```````
-
-# TODO
-# store and retrieve settings
-# github workflow setup
-# select input/ouput devices DONE
-# custom sound
-# GUI aestetich improvement
-# graphical trigger feedback
-# bug when closing application DONE
-# max value monitoring
-# automatic gain
-# possibility to run custom script
+# Import Tabs
+from tabs.mainTab import MainTab
+from tabs.visualWarningTab import VisualWarningTab
+from tabs.optionsTab import OptionsTab
+import configHandler
+import threading
 
 
 class micMonitorWindow(QMainWindow):
+    """
+    Main application window for the Microphone Guardian.
+    Manages UI, audio stream, configuration, and interactions between tabs.
+    """
+    warning_needed = pyqtSignal()
+    volume_level_updated = pyqtSignal(int)
+
     def __init__(self):
         super().__init__()
-        self.isChangedByUser = False
         self.setWindowTitle("Microphone Guardian")
-        self.setGeometry(500, 120, 400, 200)
+        self.setGeometry(500, 120, 400, 300)
 
-        self.inputDevices = [
-            device
-            for device in sd.query_devices()
-            if (device["max_input_channels"] > 0)
-        ]
-        self.outputDevices = [
-            device
-            for device in sd.query_devices()
-            if (device["max_output_channels"] > 0)
-        ]
+        # --- Internal State ---
+        self.stream = None
+        self._current_gain = 100
+        self._current_threshold = 50 
+        self._trigger_enabled = True
+        self._mute_enabled = False
+        self.samplerate = 44100 
+        self.inputDevice = None
+        self.outputDevice = None
 
-        self.triggerCheck = QCheckBox("Enable Trigger")
-        self.triggerCheck.setChecked(True)
+        self._last_webhook_time = 0
+        self._webhook_url = ""
+        self._webhook_interval_enabled = False
+        self._webhook_interval_seconds = 60
 
-        configBoxSize = 50
+        # --- Device Discovery ---
+        self.inputDevices, self.outputDevices, device_error = discover_audio_devices()
+        if device_error:
+            QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Audio Device Error", device_error))
+            self.inputDevices = []
+            self.outputDevices = []
 
-        self.thresholdSlider = QSlider()
-        self.thresholdSlider.setValue(configBoxSize)
-        self.thresholdSlider.setOrientation(Qt.Orientation.Horizontal)
-        self.thresholdSlider.setBaseSize(0, 0)
+        # --- Load Configuration ---
+        self.config = load_initial_configuration() 
+        initial_main_settings = self.config['main']
+        initial_visual_settings = self.config['visual']
+        initial_options_settings = self.config['options']
+        initial_devices_settings = self.config['devices']
+        status_message = self.config['status_message']
 
-        self.thresholdLabel = QLabel("- Trigger Threshold")
-        self.thresholdBox = QLineEdit("50")
-        self.thresholdBox.setMaximumWidth(50)
-
-        self.gainLabel = QLabel("- Mic Sensitivity (Gain)")
-        self.gainBox = QLineEdit("100")
-        self.gainBox.setMaximumWidth(configBoxSize)
-
-        # Options
-        self.frequencyLabel = QLabel("- Frequency (440 Hz is A4)")
-        self.frequencyBox = QLineEdit("500")
-        self.frequencyBox.setMaximumWidth(configBoxSize)
-
-        self.durationLabel = QLabel("- Duration in seconds")
-        self.durationBox = QLineEdit("1")
-        self.durationBox.setMaximumWidth(configBoxSize)
-
-        self.sampleRateLabel = QLabel("- Sample Rate (44100 Hz)")
-        self.sampleRateBox = QLineEdit("44100")
-        self.sampleRateBox.setMaximumWidth(configBoxSize)
-
-        self.amplitudeLabel = QLabel("- Amplitude (0.0 to 1.0)")
-        self.amplitudeBox = QLineEdit("0.75")
-        self.amplitudeBox.setMaximumWidth(configBoxSize)
-
-        self.volumeBar = QProgressBar()
-        self.volumeBar.setTextVisible(False)
-        self.feedbackLabel = QLabel()
-        self.feedbackLabel.setFixedHeight(10)
-        # self.volumeBar.setOrientation(Qt.Orientation.Vertical)
-        self.inputSelector = QComboBox()
-        self.inputSelector.addItems(
-            [
-                (str(device["index"]).format("%02d", 7) + " " + device["name"])
-                for device in self.inputDevices
-            ]
-        )
-        self.inputSelector.setCurrentText(sd.query_devices()[1]["name"])
-        self.volumeKnob = QDial()
-        self.volumeKnob.setValue(100)
-        self.outputSelector = QComboBox()
-        self.outputSelector.addItems(
-            [
-                (str(device["index"]).format("%02d", 7) + " " + device["name"])
-                for device in self.outputDevices
-            ]
-        )
-        self.outputSelector.setCurrentText(sd.query_devices()[4]["name"])
-        self.outputSelector.currentIndexChanged.connect(self.restartOutput)
-        self.saveMainButton = QPushButton("Save Settings")
-        self.cancelMainButton = QPushButton("Cancel Changes")
-        self.saveOptionsButton = QPushButton("Save Settings")
-        self.cancelOptionsButton = QPushButton("Cancel Changes")
-        # self.optionsCheck = QCheckBox("minimal mode")
-        # self.optionsCheck.checkStateChanged.connect(self.toggleOptions)
-
-        self.inputSelector.currentIndexChanged.connect(self.restartInput)
-
-        self.volumeBar.setStyleSheet(
-            """
-            QProgressBar {
-                border: 1px solid grey;
-                border-radius: 1px;
-                text-align: center;
-            }
-
-            QProgressBar::chunk {
-                background-color: green;
-            }
-        """
+        # --- Instantiate Tab Widgets ---
+        self.mainTab = MainTab(configData=initial_main_settings, parent=self)
+        self.visualWarningTab = VisualWarningTab(
+            targetWidget=self,
+            configData=initial_visual_settings,
+            parent=self
         )
 
-        self.thresholdSlider.setStyleSheet(
-            """
-            QSlider::groove:horizontal {
-                height: 0px;
-            }
-            QSlider::handle:horizontal {
-                background-color: blue; 
-                border: 1px solid black;
-                width: 10px;
-                margin: -5px 0;
-            }
-        """
+        self.optionsTab = OptionsTab(
+            config_options=initial_options_settings,
+            config_devices=initial_devices_settings,
+            parent=self
         )
 
-        self.parentGrid = QGridLayout()
-        gainLayout = QHBoxLayout()
-        thresholdLayout = QHBoxLayout()
-        self.configLayout = QGridLayout()
+        # --- Status Label ---
+        self.feedbackLabel = QLabel(status_message)
+        self.feedbackLabel.setFixedHeight(20)
 
-        gainLayout.addWidget(self.gainBox, 0, Qt.AlignmentFlag.AlignLeft)
-        gainLayout.addWidget(self.gainLabel, 0, Qt.AlignmentFlag.AlignLeft)
-
-        thresholdLayout.addWidget(self.thresholdBox, 0, Qt.AlignmentFlag.AlignLeft)
-        thresholdLayout.addWidget(self.thresholdLabel, 0, Qt.AlignmentFlag.AlignLeft)
-
-        # (arg__1,row,column,rowSpan,columnSpan,alignment)
-        self.parentGrid.addWidget(
-            self.volumeBar, 0, 0, 1, -1, Qt.AlignmentFlag.AlignBaseline
-        )
-        self.parentGrid.addWidget(
-            self.thresholdSlider, 0, 0, 1, -1, Qt.AlignmentFlag.AlignBaseline
-        )
-        self.parentGrid.addWidget(
-            self.volumeKnob, 1, 0, 2, 1, Qt.AlignmentFlag.AlignBaseline
-        )
-
-        self.parentGrid.addLayout(
-            thresholdLayout, 1, 1, 1, 1, Qt.AlignmentFlag.AlignLeft
-        )
-        self.parentGrid.addLayout(gainLayout, 2, 1, 1, 1, Qt.AlignmentFlag.AlignLeft)
-
-        # self.parentGrid.addWidget(self.feedbackLabel,4,0,1,-1,Qt.AlignmentFlag.AlignJustify)
-        self.parentGrid.addWidget(
-            self.triggerCheck, 1, 2, 1, -1, Qt.AlignmentFlag.AlignRight
-        )
-        self.parentGrid.addWidget(
-            self.saveMainButton, 3, 0, 1, -1, Qt.AlignmentFlag.AlignLeft
-        )
-        self.parentGrid.addWidget(
-            self.cancelMainButton, 3, 2, 1, -1, Qt.AlignmentFlag.AlignRight
-        )
-
-        self.configLayout.addWidget(self.frequencyBox, 0, 0)
-        self.configLayout.addWidget(self.frequencyLabel, 0, 1)
-
-        self.configLayout.addWidget(self.durationBox, 1, 0)
-        self.configLayout.addWidget(self.durationLabel, 1, 1)
-
-        self.configLayout.addWidget(self.sampleRateBox, 0, 2)
-        self.configLayout.addWidget(self.sampleRateLabel, 0, 3)
-
-        self.configLayout.addWidget(self.amplitudeBox, 1, 2)
-        self.configLayout.addWidget(self.amplitudeLabel, 1, 3)
-
-        self.configLayout.addWidget(
-            self.inputSelector, 2, 0, 1, -1, Qt.AlignmentFlag.AlignBaseline
-        )
-        self.configLayout.addWidget(
-            self.outputSelector, 3, 0, 1, -1, Qt.AlignmentFlag.AlignBaseline
-        )
-        self.configLayout.addWidget(
-            self.saveOptionsButton, 4, 0, 1, -1, Qt.AlignmentFlag.AlignLeft
-        )
-        self.configLayout.addWidget(
-            self.cancelOptionsButton, 4, 2, 1, -1, Qt.AlignmentFlag.AlignRight
-        )
-
-        # self.freq, self.duration, self.samplerate,self.amplitude
-
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.UpdateProgressBar)
-        self.timer.start()
-        self.timer.setInterval(50)
-
-        self.frequencyBox.textEdited.connect(self.UpdateOptions)
-        self.durationBox.textEdited.connect(self.UpdateOptions)
-        self.sampleRateBox.textEdited.connect(self.UpdateOptions)
-        self.amplitudeBox.textEdited.connect(self.UpdateOptions)
-
-        self.volumeKnob.valueChanged.connect(self.setGainBox)
-        self.gainBox.textEdited.connect(self.setVolumeKnob)
-        self.thresholdSlider.valueChanged.connect(self.setThresholdBox)
-        self.thresholdBox.textEdited.connect(self.setThresholdSlider)
-
-        self.saveMainButton.clicked.connect(self.updateConfigs)
-        self.saveOptionsButton.clicked.connect(self.updateConfigs)
-
-        self.cancelMainButton.clicked.connect(self.retrieveConfigs)
-        self.cancelOptionsButton.clicked.connect(self.retrieveConfigs)
-        self.setChanged(False)
-
+        # --- Tabs Setup ---
         self.tab_widget = QTabWidget()
-
-        self.mainTab = QWidget()
-        self.optionsTab = QWidget()
-
         self.tab_widget.addTab(self.mainTab, "Main")
         self.tab_widget.addTab(self.optionsTab, "Options")
-        self.mainTab.setLayout(self.parentGrid)
-        self.optionsTab.setLayout(self.configLayout)
+        self.tab_widget.addTab(self.visualWarningTab, "Visual Warning")
 
-        self.setCentralWidget(self.tab_widget)
+        # --- Main Layout ---
+        centralWidget = QWidget()
+        centralLayout = QVBoxLayout(centralWidget)
+        centralLayout.addWidget(self.tab_widget)
 
-        self.iniPath = "config.ini"
-        # Start the audio stream
-        self.stream = sd.InputStream(callback=self.ListenToMic)
-        self.restartInput()
-        self.retrieveConfigs()
+        buttonsLayout = QHBoxLayout()
+        buttonsLayout.addWidget(self.feedbackLabel)
+        buttonsLayout.addStretch()
+        self.saveButton = QPushButton("Save Settings")
+        self.cancelButton = QPushButton("Cancel Changes")
+        self.saveButton.setEnabled(True)
+        self.cancelButton.setEnabled(True)
+        buttonsLayout.addWidget(self.saveButton)
+        buttonsLayout.addWidget(self.cancelButton)
+        centralLayout.addLayout(buttonsLayout)
 
-        self.isChangedByUser = False
-        self.UpdateOptions()
-        self.isChangedByUser = (
-            True  # any future changes triggered will be from a user action
-        )
+        self.setCentralWidget(centralWidget)
 
-    def setChanged(self, isChanged):
-        self.saveMainButton.setDisabled(not isChanged)
-        self.saveOptionsButton.setDisabled(not isChanged)
-        self.cancelMainButton.setDisabled(not isChanged)
-        self.cancelOptionsButton.setDisabled(not isChanged)
+        # --- Connections ---
+        self.warning_needed.connect(self.handle_warning_trigger)
+        self.volume_level_updated.connect(self._handle_volume_update)
 
-    def setThresholdSlider(self):
-        self.thresholdSlider.setValue(int(self.thresholdBox.text()))
-        self.setChanged(True)
+        self.mainTab.gain_changed.connect(self._update_thread_safe_params)
+        self.mainTab.threshold_changed.connect(self._update_thread_safe_params)
+        self.mainTab.trigger_enabled_changed.connect(self._update_thread_safe_params)
+        self.mainTab.mute_enabled_changed.connect(self._update_thread_safe_params)
+        self.optionsTab.settingsChanged.connect(self._handle_options_tab_changed)
+        self.saveButton.clicked.connect(self.updateConfigs)
+        self.cancelButton.clicked.connect(self.retrieveConfigs)
 
-    def setThresholdBox(self):
-        self.thresholdBox.setText(str(self.thresholdSlider.value()))
-        self.setChanged(True)
+        # --- Final Initialization ---
+        self._update_thread_safe_params() 
+        self._update_webhook_params() 
 
-    def setVolumeKnob(self):
-        self.volumeKnob.setValue(int(self.gainBox.text()))
-        self.setChanged(True)
+        # Start stream based on loaded config
+        self.inputDevice = initial_devices_settings.get('inputDevice')
+        self.outputDevice = initial_devices_settings.get('outputDevice')
+        if self.inputDevice and self.inputDevices:
+            self.restartInput()
+        elif not self.inputDevices:
+            self.feedbackLabel.setText("Status: No input devices found. Cannot start monitoring.")
+        else:
+            self.feedbackLabel.setText("Status: Select an input device in Options.")
 
-    def setGainBox(self):
-        self.gainBox.setText(str(self.volumeKnob.value()))
-        self.setChanged(True)
+
+    def _handle_options_tab_changed(self):
+        """Handles the settingsChanged signal from the OptionsTab."""
+        new_input_name = self.optionsTab.get_selected_input_device_name()
+        new_output_name = self.optionsTab.get_selected_output_device_name()
+
+        self._update_webhook_params()
+
+        if new_input_name != self.inputDevice:
+            print(f"Input device selection changed from '{self.inputDevice}' to '{new_input_name}'. Restarting stream.")
+            self.inputDevice = new_input_name
+            self.restartInput()
+        elif new_output_name != self.outputDevice:
+            print(f"Output device selection changed to '{new_output_name}'.")
+            self.outputDevice = new_output_name
+
+
+    def _update_webhook_params(self):
+        """Reads webhook settings from OptionsTab and updates internal state."""
+        opts, _ = self.optionsTab.get_config_values()
+        self._webhook_url = opts.get('webhookUrl', '')
+        self._webhook_interval_enabled = opts.get('enableWebhookInterval', 'False').lower() == 'true'
+        try:
+            self._webhook_interval_seconds = int(opts.get('webhookIntervalSeconds', 60))
+        except ValueError:
+            self._webhook_interval_seconds = 60
+
+
+    def _update_status_label(self, message):
+        """Slot to update the feedback label text."""
+        self.feedbackLabel.setText(message)
+
 
     def updateConfigs(self):
-        config = ConfigParser()
-        config.read(self.iniPath)
-        if not config.has_section("main"):
-            config.add_section("main")
-        if not config.has_section("options"):
-            config.add_section("options")
-        if not config.has_section("devices"):
-            config.add_section("devices")
+        """
+        Gathers current settings from all tabs and saves them using configHandler.
+        """
+        print("Gathering UI state for saving...")
+        try:
+            main_settings = self.mainTab.get_config_values()
+            visual_settings = self.visualWarningTab.get_config_values()
+            options_settings, devices_settings = self.optionsTab.get_config_values()
 
-        config.set("main", "gainBox", self.gainBox.text())
-        config.set("main", "thresholdBox", self.thresholdBox.text())
-        config.set("main", "triggerCheck", str(self.triggerCheck.isChecked()))
+            devices_settings['inputDevice'] = self.inputDevice or ''
+            devices_settings['outputDevice'] = self.outputDevice or ''
 
-        config.set("options", "frequencyBox", self.frequencyBox.text())
-        config.set("options", "durationBox", self.durationBox.text())
-        config.set("options", "sampleRateBox", self.sampleRateBox.text())
-        config.set("options", "amplitudeBox", self.amplitudeBox.text())
+            current_settings = {
+                "main": main_settings,
+                "options": options_settings,
+                "devices": devices_settings,
+                "visual": visual_settings
+            }
+            _, message = configHandler.save_config(current_settings)
+            self._update_status_label(message)
+        except Exception as e:
+            error_msg = f"Status: Error saving settings: {e}"
+            print(f"Error gathering or saving settings: {e}\n{traceback.format_exc()}")
+            self._update_status_label(error_msg)
 
-        config.set("devices", "inputSelector", self.inputSelector.currentText())
-        config.set("devices", "outputSelector", self.outputSelector.currentText())
-
-        with open(self.iniPath, "w") as f:
-            config.write(f)
-
-        self.setChanged(False)
 
     def retrieveConfigs(self):
-        config = ConfigParser()
-        config.read(self.iniPath)
+        """
+        Loads settings from the configuration file and re-applies them to the UI,
+        effectively cancelling any unsaved user changes by recreating tabs.
+        """
+        print("Re-loading configuration (Cancel pressed)...")
 
-        self.isChangedByUser = False
+        self.config = load_initial_configuration()
+        initial_main_settings = self.config['main']
+        initial_visual_settings = self.config['visual']
+        initial_options_settings = self.config['options']
+        initial_devices_settings = self.config['devices']
+        status_message = self.config['status_message']
+        self._update_status_label(status_message)
 
-        self.volumeKnob.setValue(int(config.get("main", "gainBox", fallback="100")))
-        self.thresholdSlider.setValue(
-            int(config.get("main", "thresholdBox", fallback="50"))
-        )
-        self.gainBox.setText(config.get("main", "gainBox", fallback="100"))
-        self.thresholdBox.setText(config.get("main", "thresholdBox", fallback="50"))
-        self.triggerCheck.setChecked(
-            bool(config.get("main", "triggerCheck", fallback="True"))
-        )
+        if not self.config['load_ok']:
+             print("Warning: Configuration file could not be read properly.")
+        try:
+            # --- Recreate MainTab ---
+            self.mainTab.deleteLater()
+            self.mainTab = MainTab(configData=initial_main_settings, parent=self)
+            self.mainTab.gain_changed.connect(self._update_thread_safe_params)
+            self.mainTab.threshold_changed.connect(self._update_thread_safe_params)
+            self.mainTab.trigger_enabled_changed.connect(self._update_thread_safe_params)
+            self.mainTab.mute_enabled_changed.connect(self._update_thread_safe_params)
+            self.tab_widget.removeTab(self.tab_widget.indexOf(self.tab_widget.findChild(MainTab))) 
+            self.tab_widget.insertTab(0, self.mainTab, "Main")
 
-        self.frequencyBox.setText(config.get("options", "frequencyBox", fallback="440"))
-        self.durationBox.setText(config.get("options", "durationBox", fallback="1"))
-        self.sampleRateBox.setText(
-            config.get("options", "sampleRateBox", fallback="44100")
-        )
-        self.amplitudeBox.setText(
-            config.get("options", "amplitudeBox", fallback="0.75")
-        )
+            # --- Recreate OptionsTab ---
+            self.optionsTab.deleteLater()
+            self.optionsTab = OptionsTab(
+                config_options=initial_options_settings,
+                config_devices=initial_devices_settings,
+                parent=self
+            )
+            self.optionsTab.settingsChanged.connect(self._handle_options_tab_changed)
+            self.tab_widget.removeTab(self.tab_widget.indexOf(self.tab_widget.findChild(OptionsTab)))
+            self.tab_widget.insertTab(1, self.optionsTab, "Options")
 
-        self.inputSelector.setCurrentText(
-            config.get("devices", "inputSelector", fallback="")
-        )
-        self.outputSelector.setCurrentText(
-            config.get("devices", "outputSelector", fallback="")
-        )
+            self.visualWarningTab.deleteLater()
+            self.visualWarningTab = VisualWarningTab(
+                targetWidget=self,
+                configData=initial_visual_settings,
+                parent=self
+            )
+            self.tab_widget.removeTab(self.tab_widget.indexOf(self.tab_widget.findChild(VisualWarningTab)))
+            self.tab_widget.insertTab(2, self.visualWarningTab, "Visual Warning")
 
-        self.setChanged(False)
-        self.isChangedByUser = True  # Next change would be triggered by a user
+            self.tab_widget.setCurrentIndex(0)
+            self._update_thread_safe_params()
+            self._update_webhook_params()
 
-    def toggleOptions(self):
-        inverted = not (self.optionsCheck.isChecked())
-        self.inputSelector.setVisible(inverted)
-        self.outputSelector.setVisible(inverted)
-        self.gainBox.setVisible(inverted)
-        # self.debugButton.setVisible(inverted)
-        # self.knob.setVisible(inverted)
-        self.feedbackLabel.setVisible(inverted)
+            self.inputDevice = initial_devices_settings.get('input_device_name')
+            self.outputDevice = initial_devices_settings.get('output_device_name')
+
+            if self.inputDevice and self.inputDevices:
+                 print("Reloading config, restarting input stream.")
+                 self.restartInput()
+            elif not self.inputDevices:
+                 self.stop_stream()
+                 self._update_status_label("Status: No input devices found. Cannot start monitoring.")
+            else:
+                 self.stop_stream()
+                 self._update_status_label("Status: Select an input device in Options.")
+
+
+            print("Finished re-loading configuration.")
+
+        except Exception as e:
+            error_msg = f"Status: Error applying reloaded settings: {e}"
+            print(f"Error applying loaded settings (retrieveConfigs): {e}\n{traceback.format_exc()}")
+            self._update_status_label(error_msg)
+
+
+    def _find_device_index_by_name(self, device_name, device_list):
+        """Finds the index of a device in a list by its name."""
+        if not device_name or not device_list:
+            return None
+        for i, device in enumerate(device_list):
+            if device.get('name') == device_name:
+                return device.get('index')
+        return None
+
+    def _get_device_default_samplerate(self, device_index, kind='input'):
+        """Queries a device for its default sample rate."""
+        try:
+            device_info = sd.query_devices(device=device_index, kind=kind)
+            if device_info and isinstance(device_info, dict):
+                rate = int(device_info.get('default_samplerate', 0))
+                print(f"Device {device_index} default sample rate: {rate}")
+                return rate if rate > 0 else None
+        except Exception as e:
+            print(f"Error querying sample rate for device {device_index}: {e}")
+        return None
+
+
+    def _update_thread_safe_params(self):
+        """
+        Updates internal copies of gain, threshold, trigger enable, mute enable.
+        """
+        self._current_gain = self.mainTab.get_gain()
+        self._current_threshold = self.mainTab.get_threshold()
+        self._trigger_enabled = self.mainTab.is_trigger_enabled()
+        self._mute_enabled = self.mainTab.is_mute_enabled()
+
+
+    def stop_stream(self):
+        """Stops and closes the active audio input stream."""
+        if self.stream:
+            try:
+                if self.stream.active:
+                    self.stream.stop()
+                self.stream.close()
+                print("Audio stream stopped and closed.")
+            except Exception as e:
+                print(f"Warning: Error stopping/closing stream: {e}")
+            finally:
+                self.stream = None
+
 
     def restartInput(self):
-        if self.stream.active:
-            self.stream.close()
+        """
+        Stops existing stream, finds device index by name, queries sample rate,
+        and starts a new InputStream.
+        """
+        self.stop_stream()
+
+        if not self.inputDevice:
+             self._update_status_label("Status: Cannot start stream - No Input Device selected.")
+             print("Stream start aborted: No input device name.")
+             return
+
+        device_index = self._find_device_index_by_name(self.inputDevice, self.inputDevices)
+
+        if device_index is None:
+            self._update_status_label(f"Status: Input device '{self.inputDevice}' not found.")
+            print(f"Stream start aborted: Could not find index for device '{self.inputDevice}'.")
+            return
+
+        queried_samplerate = self._get_device_default_samplerate(device_index, kind='input')
+        if queried_samplerate:
+            self.samplerate = queried_samplerate
+        elif self.samplerate <= 0:
+            self.samplerate = 44100
+            print(f"Warning: Could not query sample rate for device {device_index}. Using default {self.samplerate} Hz.")
+
+        if self.samplerate <= 0:
+            self._update_status_label("Status: Cannot start stream - Invalid Sample Rate.")
+            print(f"Stream start aborted: Invalid sample rate ({self.samplerate}).")
+            return
+
         try:
-            sd.default.device = [
-                int(self.inputSelector.currentText()[0:2]),
-                sd.default.device[1],
-            ]
-            self.stream = sd.InputStream(callback=self.ListenToMic)
+            print(f"Attempting to start input stream on device {device_index} ('{self.inputDevice}') with SR={self.samplerate}")
+
+            sd.default.device = device_index
+            print(f"Set sd.default.device input to: {device_index}")
+
+            self.stream = sd.InputStream(
+                callback=self.ListenToMic,
+                samplerate=self.samplerate,
+                device=device_index,
+                dtype='float32'
+            )
             self.stream.start()
-            self.feedbackLabel.setText("Started")
-        except Exception as e:
-            self.feedbackLabel.setText(e)
-            print(e)
+            self._update_status_label(f"Status: Monitoring '{self.inputDevice}'")
+            print("Input stream started successfully.")
 
-    def restartOutput(self):
+        except sd.PortAudioError as pae:
+            msg = f"Status: PortAudio Error starting stream - {pae}"
+            self._update_status_label(msg)
+            print(f"PortAudioError starting stream: {pae}")
+            self.stream = None
+        except ValueError as ve:
+             msg = f"Status: Value Error starting stream - {ve}"
+             self._update_status_label(msg)
+             print(f"ValueError starting stream (invalid device index?): {ve}")
+             self.stream = None
+        except Exception as e:
+            msg = f"Status: Error starting stream - {e}"
+            self._update_status_label(msg)
+            print(f"Error starting stream: {e}\n{traceback.format_exc()}")
+            self.stream = None
+
+
+    def ListenToMic(self, indata, frames, callback_time_info, status):
+        """Audio callback function (executed in a separate thread)."""
+        if status:
+            if status.input_overflow: print("Warning: Input overflow", file=sys.stderr)
+            if status.input_underflow: print("Warning: Input underflow", file=sys.stderr)
+
         try:
-            sd.default.device = [
-                sd.default.device[0],
-                int(self.outputSelector.currentText()[0:2]),
-            ]
-            # self.PlayTone()
-            if self.isChangedByUser:
-                self.setChanged(True)
+            gain_factor = self._current_gain / 100.0
+            threshold_level = self._current_threshold
+            is_trigger_on = self._trigger_enabled
+
+            if indata is None or indata.size == 0:
+                volume_rms = 0
             else:
-                self.setChanged(False)
+                amplified_data = indata * gain_factor
+                if amplified_data.size > 0:
+                    volume_rms = np.sqrt(np.mean(np.square(amplified_data)))
+                else:
+                    volume_rms = 0
 
+            scaling_factor = 300
+            calculated_level = min(int(volume_rms * scaling_factor), 100)
+
+            self.volume_level_updated.emit(calculated_level)
+
+            if is_trigger_on and calculated_level >= threshold_level:
+                self.warning_needed.emit()
+
+                # --- Basic Webhook Logic ---
+                if self._webhook_url:
+                    now = time.monotonic()
+                    should_send = True
+                    if self._webhook_interval_enabled:
+                        if now - self._last_webhook_time < self._webhook_interval_seconds:
+                            should_send = False
+
+                    if should_send:
+                        self._last_webhook_time = now
+                        thread = threading.Thread(target=self._send_webhook_request, args=(self._webhook_url,), daemon=True)
+                        thread.start()
         except Exception as e:
-            self.feedbackLabel.setText(e)
-            print(e)
+            print(f"Error in ListenToMic callback: {e}\n{traceback.format_exc()}", file=sys.stderr)
 
-    def ListenToMic(self, indata, frames, time, status):
-        # Calculate the volume as the norm of the input data
-        self.volume_level = np.linalg.norm(indata) * int(self.gainBox.text())
-
-    def UpdateProgressBar(self):
-        # Update the progress bar with the current volume level
-        self.volumeBar.setValue(min(int(self.volume_level), 100))
-
-        if (
-            self.volume_level > self.thresholdSlider.value()
-            and self.triggerCheck.isChecked()
-        ):
-            self.Trigger()
-
-    def UpdateOptions(self):
-        # check to see if action was by a user or loading
-        if self.isChangedByUser:
-            self.setChanged(True)
-        else:
-            self.setChanged(False)
-
+    def _send_webhook_request(self, url):
+        """Sends a GET request to the specified URL (runs in a separate thread)."""
         try:
-            self.freq = int(self.frequencyBox.text())
-            self.frequencyBox.setStyleSheet("color: blue;")
-        except ValueError:
-            self.frequencyBox.setStyleSheet("color: red;")
+            response = requests.get(url, timeout=5)
+            response.raise_for_status()
+            print(f"Webhook GET request sent successfully to {url}, Status: {response.status_code}")
+        except requests.exceptions.RequestException as e:
+            print(f"Error sending webhook GET request to {url}: {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"Unexpected error during webhook request to {url}: {e}", file=sys.stderr)
 
-        try:
-            self.duration = float(self.durationBox.text())
-            self.durationBox.setStyleSheet("color: blue;")
-        except ValueError:
-            self.durationBox.setStyleSheet("color: red;")
+    def _handle_volume_update(self, level):
+        """Updates the volume bar in the MainTab (GUI thread)."""
+        self.mainTab.update_volume_bar(level, self._current_threshold)
 
-        try:
-            self.samplerate = int(self.sampleRateBox.text())
-            self.sampleRateBox.setStyleSheet("color: blue;")
-        except ValueError:
-            self.sampleRateBox.setStyleSheet("color: red;")
+    def handle_warning_trigger(self):
+        """Handles visual and audio warnings (GUI thread)."""
+        if not self._mute_enabled:
+            amplitude = 0.5
+            frequency = 440
+            duration = 0.2
 
-        try:
-            self.amplitude = float(self.amplitudeBox.text())
-            self.amplitudeBox.setStyleSheet("color: blue;")
-        except ValueError:
-            self.amplitudeBox.setStyleSheet("color: red;")
+            if amplitude > 0 and duration > 0 and self.samplerate > 0 and frequency > 0:
+                output_device_index = self._find_device_index_by_name(self.outputDevice, self.outputDevices)
 
-    def Trigger(self):
-        self.PlayTone(self.freq, self.duration, self.samplerate, self.amplitude)
+                try:
+                    t = np.linspace(0., duration, int(self.samplerate * duration), endpoint=False)
+                    waveform = amplitude * np.sin(2. * np.pi * frequency * t, dtype=np.float32)
+                    sd.play(waveform, self.samplerate, device=output_device_index, blocking=False)
+                except Exception as e:
+                    msg = f"Status: Audio Warning Error - {e}"
+                    self._update_status_label(msg)
+                    print(f"Error playing warning sound: {e}", file=sys.stderr)
+            else:
+                pass # Silently skip if parameters are invalid
 
-    def PlayTone(self, freq=500, duration=1, samplerate=44100, amplitude=0.75):
-        """
-        Play a sine wave tone. (by GPT)
+        self.visualWarningTab.trigger()
 
-        Parameters:
-        - frequency: Frequency of the sine wave in Hz (default: 440 Hz, which is A4 note).
-        - duration: Duration of the tone in seconds (default: 1 second).
-        - samplerate: Sampling rate in samples per second (default: 44100 Hz).
-        - amplitude: Amplitude of the wave (default: 0.5, range: 0.0 to 1.0).
-        """
-        # Generate time points
-        t = np.linspace(0, duration, int(samplerate * duration), endpoint=False)
-
-        # Generate sine wave
-        wave = amplitude * np.sin(2 * np.pi * freq * t)
-
-        # Play the sound
-        sd.play(wave, samplerate)
-        sd.wait()  # Wait until the sound has finished playing
-
+    def closeEvent(self, event):
+        """Handles the window closing event."""
+        print("Closing application...")
+        self.stop_stream()
+        print("Cleanup finished.")
+        event.accept()
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    font = QFont("Aptos", 10)
-    app.setFont(font)
-    listenerWindow = micMonitorWindow()
-    listenerWindow.show()
-    app.exec()
-    listenerWindow.stream.close()
+    if hasattr(Qt.ApplicationAttribute, 'AA_EnableHighDpiScaling'):
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling, True)
+    if hasattr(Qt.ApplicationAttribute, 'AA_UseHighDpiPixmaps'):
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
+
+    try:
+        print("Starting Microphone Guardian...")
+        app = QApplication(sys.argv)
+        listenerWindow = micMonitorWindow()
+        listenerWindow.show()
+        exit_code = app.exec()
+    except Exception as e:
+        print(f"\nFATAL ERROR during application startup or execution: {e}")
+        traceback.print_exc()
+        try:
+            msgBox = QMessageBox()
+            msgBox.setIcon(QMessageBox.Icon.Critical)
+            msgBox.setWindowTitle("Fatal Error")
+            msgBox.setText(f"A fatal error occurred:\n{e}\n\nSee console for details.")
+            msgBox.setStandardButtons(QMessageBox.StandardButton.Ok)
+            msgBox.exec()
+        except Exception as msg_e:
+            print(f"Could not display error message box: {msg_e}")
+        exit_code = 1
+    finally:
+        print(f"Exiting with code {exit_code if 'exit_code' in locals() else 1}.")
+        sys.exit(exit_code if 'exit_code' in locals() else 1)
